@@ -1,630 +1,380 @@
 import pandas as pd
+import numpy as np
 import os
-from glob import glob
 import re
-from collections import Counter
+from glob import glob
 
 
 def clean_style_number(style_num):
-    """清洗款号,去除多余的符号"""
+    """改进的款号清洗函数"""
     if pd.isna(style_num):
         return style_num
-    # 去除-Q2, -Q3, -翻单, -网单等后缀
-    return str(style_num).split('-')[0]
+    style_str = str(style_num).strip()
+
+    # 处理特殊案例
+    special_cases = {
+        r'76Z0001\d+': '76Z0001', r'31110011': '3111-0011', r'15CO156': '15C0156',
+        r'15F0189B': '15F0189', r'12C0933加单': '12C0933', r'15C0196翻单': '15C0196',
+        r'12C1536': '12C1450', r'67C0015': '12C1470', r'12C1572': '12C1450',
+        r'16A0509.*': '16A0509', r'17A0025.*': '17A0025', r'18A0002.*': '18A0002',
+    }
+    for pattern, replacement in special_cases.items():
+        if re.match(pattern, style_str):
+            return replacement
+
+    # 移除特定的后缀词
+    cleaned = re.sub(r'(加单|翻单|男|女|加急|特急|返工|返修|补数).*$', '', style_str)
+    cleaned = re.sub(r'-[A-Z]\d+$', '', cleaned)
+    cleaned = re.sub(r'-\d{1,2}$', '', cleaned)
+
+    # 处理数字+字母+数字的格式
+    match = re.match(r'(\d+)([A-Z]+)(\d+)', cleaned)
+    if match:
+        num1, letters, num2 = match.groups()
+        cleaned = f"{num1}{letters}{num2}"
+
+    return cleaned
 
 
-def is_valid_worker_name(name):
-    """验证是否是有效的工人姓名"""
-    if pd.isna(name) or name == '':
-        return False
-    name_str = str(name).strip()
+def parse_common_structure_fixed(df_raw, source_name, name_row_idx, process_row_idx, process_seq_row_idx,
+                                 data_start_row):
+    melted_rows = []
 
-    # 排除明显不是姓名的内容
-    invalid_keywords = ['Total', 'total', '合计', '小计', '制单号', '款号', '日期',
-                        '工序', '数量', 'NaN', 'nan']
-    if any(kw in name_str for kw in invalid_keywords):
-        return False
+    try:
+        # 员工姓名
+        name_row = df_raw.iloc[name_row_idx].values if name_row_idx < len(df_raw) else []
+        # 工序信息
+        process_row = df_raw.iloc[process_row_idx].values if process_row_idx < len(df_raw) else []
+        # 工序序号
+        process_seq_row = df_raw.iloc[process_seq_row_idx].values if process_seq_row_idx < len(df_raw) else []
 
-    # 长度检查:中文姓名一般2-4个字
-    if len(name_str) > 5:
-        return False
+        employee_columns = {}
+        for j in range(len(name_row)):
+            if pd.notna(name_row[j]):
+                cell_val = str(name_row[j]).strip()
+                if (2 <= len(cell_val) <= 20 and
+                        any('\u4e00' <= char <= '\u9fff' for char in cell_val) or
+                        cell_val.isalpha() and 2 <= len(cell_val) <= 10):
+                    employee_columns[j] = cell_val
 
-    # 检查是否包含中文字符
-    has_chinese = any('\u4e00' <= char <= '\u9fff' for char in name_str)
+        print(f"找到员工列: {len(employee_columns)} 个员工")
 
-    # 如果包含数字,可能不是姓名(除非是"6组"这种)
-    if name_str.isdigit() and '组' not in name_str:
-        return False
+        # 工序名称及其范围
+        process_ranges = []
+        current_process = ""
+        start_col = None
 
-    return has_chinese or '组' in name_str
+        for j in range(len(process_row)):
+            cell_val = process_row[j] if pd.notna(process_row[j]) else ""
+            cell_str = str(cell_val).strip()
 
-
-def is_valid_process_name(name):
-    """验证是否是有效的工序名称 - 放宽验证条件"""
-    if pd.isna(name) or name == '':
-        return False
-    name_str = str(name).strip()
-
-    # 如果为空字符串,返回False
-    if name_str == '':
-        return False
-
-    # 排除明显不是工序名称的内容
-    invalid_keywords = ['Total', 'total', '合计', '小计', '制单号', '款号', '日期',
-                        '姓名', '工人', '员工', 'NaN', 'nan']
-    if any(kw in name_str for kw in invalid_keywords):
-        return False
-
-    # 检查是否包含中文字符
-    has_chinese = any('\u4e00' <= char <= '\u9fff' for char in name_str)
-
-    # 只要包含中文就认为可能是工序名称(放宽条件)
-    return has_chinese
-
-
-def find_header_rows(df_raw, data_start_row):
-    """智能查找工序行和工人行的位置"""
-    possible_combinations = []
-
-    # 在数据开始行之前的10行内查找
-    search_range = range(max(0, data_start_row - 10), data_start_row)
-
-    for i in search_range:
-        for j in range(i + 1, data_start_row):
-            # 检查这两行是否可能是工序行和工人行
-            row_i = df_raw.iloc[i]
-            row_j = df_raw.iloc[j]
-
-            # 统计每行有多少有效的工人姓名
-            valid_names_i = sum(1 for val in row_i[5:50] if is_valid_worker_name(val))
-            valid_names_j = sum(1 for val in row_j[5:50] if is_valid_worker_name(val))
-
-            # 统计每行有多少有效的工序名称
-            valid_process_i = sum(1 for val in row_i[5:50] if is_valid_process_name(val))
-            valid_process_j = sum(1 for val in row_j[5:50] if is_valid_process_name(val))
-
-            # 如果某一行有较多有效姓名,可能是工人行，另一行可能是工序行
-            if (valid_names_i >= 3 and valid_process_j >= 1) or (valid_names_j >= 3 and valid_process_i >= 1):
-                score = valid_names_i + valid_names_j + valid_process_i + valid_process_j
-                # 确定哪一行更可能是工序行，哪一行更可能是工人行
-                if valid_process_i > valid_process_j and valid_names_j > valid_names_i:
-                    possible_combinations.append((i, j, score))  # i是工序行，j是工人行
-                elif valid_process_j > valid_process_i and valid_names_i > valid_names_j:
-                    possible_combinations.append((j, i, score))  # j是工序行，i是工人行
-                else:
-                    # 如果不能明确区分，尝试两种组合
-                    possible_combinations.append((i, j, score))
-                    possible_combinations.append((j, i, score))
-
-    # 按得分排序,返回最可能的组合
-    possible_combinations.sort(key=lambda x: x[2], reverse=True)
-
-    # 返回前5个最可能的组合，去除重复
-    unique_combinations = []
-    seen = set()
-    for combo in possible_combinations:
-        key = (combo[0], combo[1])
-        if key not in seen:
-            seen.add(key)
-            unique_combinations.append((combo[0], combo[1]))
-        if len(unique_combinations) >= 5:
-            break
-
-    return unique_combinations
-
-
-def extract_rework_data_improved():
-    """改进的返工数据提取函数"""
-    print("开始改进的返工数据提取...")
-
-    rework_files = [
-        '返工数量/返工率—张大丽.xlsx',
-        '返工数量/返工率—曾繁利.xlsx',
-        '返工数量/返工率—李小萍.xlsx',
-        '返工数量/返工率—范丽.xlsx',
-        '返工数量/返工率—范嗣惠.xlsx',
-        '返工数量/返工率—陈亚梅.xlsx',
-        '返工数量/返工率—陈定芬6组.xlsx',
-        '返工数量/返工率—陈定芬7组.xlsx'
-    ]
-
-    existing_files = [f for f in rework_files if os.path.exists(f)]
-    print(f"找到 {len(existing_files)} 个返工文件")
-
-    all_rework_records = []
-
-    for file_path in existing_files:
-        try:
-            print(f"\n{'=' * 60}")
-            print(f"处理文件: {os.path.basename(file_path)}")
-
-            df_raw = pd.read_excel(file_path, header=None)
-            print(f"文件形状: {df_raw.shape}")
-
-            # 查找数据开始行
-            data_start_row = None
-            for i in range(min(15, len(df_raw))):
-                style_val = df_raw.iloc[i, 0]
-                if pd.notna(style_val) and '制单号' in str(style_val):
-                    data_start_row = i + 1
-                    break
-
-            if data_start_row is None:
-                print("⚠️ 未找到数据开始行,跳过此文件")
-                continue
-
-            print(f"数据开始行: {data_start_row}")
-
-            # 智能查找工序行和工人行
-            header_combinations = find_header_rows(df_raw, data_start_row)
-
-            if not header_combinations:
-                # 如果智能查找失败,使用固定的组合
-                header_combinations = [
-                    (data_start_row - 3, data_start_row - 2),
-                    (data_start_row - 4, data_start_row - 3),
-                    (data_start_row - 5, data_start_row - 4),
-                    (data_start_row - 2, data_start_row - 1),
-                ]
-
-            print(f"尝试 {len(header_combinations)} 种表头组合")
-
-            best_records = []
-            best_score = 0
-            best_process_count = 0  # 记录有工序名称的数量
-
-            for combo_idx, (process_row, worker_row) in enumerate(header_combinations):
-                if process_row < 0 or worker_row < 0:
+            if cell_str:  # 有内容的单元格
+                if current_process and current_process != cell_str:
+                    # 遇到新的工序名称，保存前一个工序的范围
+                    process_ranges.append((current_process, start_col, j - 1))
+                    current_process = cell_str
+                    start_col = j
+                elif not current_process:
+                    # 开始第一个工序
+                    current_process = cell_str
+                    start_col = j
+            else:  # 空单元格
+                if current_process:
+                    # 继续当前工序的范围
                     continue
 
-                print(f"\n尝试组合 {combo_idx + 1}: 工序行={process_row}, 工人行={worker_row}")
+        # 处理最后一个工序
+        if current_process and start_col is not None:
+            process_ranges.append((current_process, start_col, len(process_row) - 1))
 
-                current_style = None
-                temp_records = []
+        # 识别工序序号及其范围
+        process_seq_ranges = []
+        current_process_seq = ""
+        start_col_seq = None
 
-                # 扫描数据行
-                for i in range(data_start_row, min(data_start_row + 200, len(df_raw))):
-                    style_val = df_raw.iloc[i, 0]
+        # 扫描工序序号行，识别每个工序序号的范围
+        for j in range(len(process_seq_row)):
+            cell_val = process_seq_row[j] if pd.notna(process_seq_row[j]) else ""
+            cell_str = str(cell_val).strip()
 
-                    # 更新当前款号
-                    if pd.notna(style_val) and 'Total' not in str(style_val):
-                        style_str = str(style_val).strip()
-                        if len(style_str) > 3 and '制单号' not in style_str:
-                            current_style = style_str
+            if cell_str:  # 有内容的单元格
+                if current_process_seq and current_process_seq != cell_str:
+                    # 遇到新的工序序号，保存前一个工序序号的范围
+                    process_seq_ranges.append((current_process_seq, start_col_seq, j - 1))
+                    current_process_seq = cell_str
+                    start_col_seq = j
+                elif not current_process_seq:
+                    # 开始第一个工序序号
+                    current_process_seq = cell_str
+                    start_col_seq = j
+            else:  # 空单元格
+                if current_process_seq:
+                    # 继续当前工序序号的范围
+                    continue
 
-                    # 处理日期行
-                    date_val = df_raw.iloc[i, 4]
-                    if pd.notna(date_val) and current_style:
-                        try:
-                            date_obj = pd.to_datetime(date_val)
-                            date_str = date_obj.strftime('%Y-%m-%d')
+        # 处理最后一个工序序号
+        if current_process_seq and start_col_seq is not None:
+            process_seq_ranges.append((current_process_seq, start_col_seq, len(process_seq_row) - 1))
 
-                            # 扫描该行的所有列查找返工数据
-                            for col in range(5, min(len(df_raw.columns), 200)):
-                                rework_value = df_raw.iloc[i, col]
+        # 每个员工对应的工序名称和工序序号
+        worker_process_info = {}
+        worker_process_seq_info = {}
 
-                                if pd.notna(rework_value) and rework_value != '':
-                                    try:
-                                        rework_qty = float(rework_value)
-                                        if rework_qty > 0 and rework_qty < 10000:  # 合理范围
-                                            # 获取工序和工人信息
-                                            process_name = df_raw.iloc[process_row, col]
-                                            worker_name = df_raw.iloc[worker_row, col]
+        for col_idx, employee_name in employee_columns.items():
+            assigned_process = ""
+            assigned_process_seq = ""
 
-                                            # 关键修改:只验证工人姓名,工序名称即使无效也保存原始值
-                                            if is_valid_worker_name(worker_name):
-                                                # 清理工序名称但保留原始值
-                                                process_str = ''
-                                                if pd.notna(process_name):
-                                                    process_str = str(process_name).strip()
+            # 查找这个员工列属于哪个工序名称的范围
+            for process_name, start_col, end_col in process_ranges:
+                if start_col <= col_idx <= end_col:
+                    assigned_process = process_name
+                    break
 
-                                                record = {
-                                                    '款号': current_style,
-                                                    '日期': date_str,
-                                                    '工序名称_返工': process_str,  # 保留原始工序名称
-                                                    '工人姓名': str(worker_name).strip(),
-                                                    '返工数量': rework_qty,
-                                                    '来源文件': os.path.basename(file_path),
-                                                    '组合': f"{process_row}-{worker_row}"
-                                                }
-                                                temp_records.append(record)
-                                    except (ValueError, TypeError):
-                                        continue
-                        except (ValueError, TypeError):
-                            continue
+            # 查找这个员工列属于哪个工序序号的范围
+            for process_seq, start_col_seq, end_col_seq in process_seq_ranges:
+                if start_col_seq <= col_idx <= end_col_seq:
+                    assigned_process_seq = process_seq
+                    break
 
-                # 评估这个组合的质量
-                valid_records = [r for r in temp_records if is_valid_worker_name(r['工人姓名'])]
-                score = len(valid_records)
+            worker_process_info[col_idx] = assigned_process
+            worker_process_seq_info[col_idx] = assigned_process_seq
 
-                # 计算有工序名称的记录数
-                process_count = sum(1 for r in valid_records if r['工序名称_返工'] and r['工序名称_返工'] != '')
+        assigned_count = sum(1 for process in worker_process_info.values() if process)
+        assigned_seq_count = sum(1 for process_seq in worker_process_seq_info.values() if process_seq)
+        print(f"工序分配: {assigned_count}/{len(employee_columns)} 个员工有工序名称")
+        print(f"工序序号分配: {assigned_seq_count}/{len(employee_columns)} 个员工有工序序号")
 
-                print(f"✓ 找到 {score} 条有效记录，其中有工序名称的: {process_count} 条")
+        current_style = None
 
-                # 显示工序名称统计
-                process_names = [r['工序名称_返工'] for r in valid_records if r['工序名称_返工']]
-                if process_names:
-                    unique_processes = set(process_names)
-                    print(f"  包含 {len(unique_processes)} 种不同工序: {list(unique_processes)[:5]}...")
+        for i in range(data_start_row, min(len(df_raw), data_start_row + 500)):
+            row_data = df_raw.iloc[i]
 
-                # 优先选择有更多工序名称的组合
-                if score > best_score or (score == best_score and process_count > best_process_count):
-                    best_score = score
-                    best_process_count = process_count
-                    best_records = valid_records
+            # 款号和日期
+            style_val = row_data.iloc[0] if 0 < len(row_data) else None
+            date_val = row_data.iloc[4] if 4 < len(row_data) else None
 
-            if best_records:
-                all_rework_records.extend(best_records)
-                print(f"\n✓ 从文件提取了 {len(best_records)} 条返工记录")
-                print(
-                    f"✓ 其中有工序名称的记录: {sum(1 for r in best_records if r['工序名称_返工'] and r['工序名称_返工'] != '')} 条")
+            # 更新当前款号
+            if pd.notna(style_val):
+                style_str = str(style_val).strip()
+                if 'Total' not in style_str and '合计' not in style_str and style_str:
+                    current_style = style_str
 
-                # 显示部分记录样本
-                print("记录样本:")
-                for record in best_records[:3]:
-                    print(f"  款号={record['款号']}, 日期={record['日期']}, "
-                          f"工人={record['工人姓名']}, 返工={record['返工数量']}, 工序={record['工序名称_返工']}")
-            else:
-                print(f"⚠️ 未能从此文件提取到有效数据")
+            # 处理有日期的行
+            if pd.notna(date_val) and current_style:
+                try:
+                    date_obj = pd.to_datetime(str(date_val))
 
-        except Exception as e:
-            print(f"❌ 处理文件出错: {e}")
-            import traceback
-            traceback.print_exc()
+                    # 处理每个员工列的数据
+                    for col_idx, employee_name in employee_columns.items():
+                        if col_idx < len(row_data):
+                            rework_val = row_data.iloc[col_idx]
+
+                            if pd.notna(rework_val):
+                                try:
+                                    rework_count = float(rework_val)
+                                    if rework_count > 0:
+                                        process_name = worker_process_info.get(col_idx, "")
+                                        process_seq = worker_process_seq_info.get(col_idx, "")
+
+                                        record = {
+                                            '款号': current_style,
+                                            '日期': date_obj,
+                                            '姓名': employee_name,
+                                            '每日返工数量': rework_count,
+                                            '返工率表格中的工序名称': process_name,
+                                            '返工率表格中的工序序号': process_seq,  # 新增工序序号
+                                            '组别': '',
+                                            '生产工号': '',
+                                            '来源': source_name
+                                        }
+                                        melted_rows.append(record)
+
+                                except (ValueError, TypeError):
+                                    continue
+
+                except Exception as e:
+                    continue
+
+        records_with_process = sum(1 for record in melted_rows if record['返工率表格中的工序名称'])
+        records_with_seq = sum(1 for record in melted_rows if record['返工率表格中的工序序号'])
+        print(
+            f"解析结果: {len(melted_rows)} 条记录，{records_with_process} 条有工序名称，{records_with_seq} 条有工序序号")
+        return melted_rows
+
+    except Exception as e:
+        print(f"解析 {source_name} 文件时出错: {e}")
+        import traceback
+        traceback.print_exc()
+        return melted_rows
+
+
+# 不同表格使用不同解析方法，根据您提供的信息调整参数
+def parse_chenyamei(df_raw):
+    # 陈亚梅：名字在第3行，工序信息在第4行，工序序号在第5行
+    return parse_common_structure_fixed(df_raw, '陈亚梅', 3, 4, 5, 9)
+
+
+def parse_fanli(df_raw):
+    # 范丽：名字在第7行，工序信息在第8行，工序序号在第5行
+    return parse_common_structure_fixed(df_raw, '范丽', 7, 8, 5, 9)
+
+
+def parse_fansihui(df_raw):
+    # 范嗣惠：名字在第7行，工序信息在第5行，工序序号在第4行
+    return parse_common_structure_fixed(df_raw, '范嗣惠', 7, 5, 4, 10)
+
+
+def parse_zengfanli(df_raw):
+    # 曾繁利：名字在第8行，工序信息在第3行，工序序号在第4行
+    return parse_common_structure_fixed(df_raw, '曾繁利', 8, 3, 4, 9)
+
+
+def parse_chendingfen(df_raw, group_name):
+    # 陈定芬：名字在第8行，工序信息在第3行，工序序号在第4行
+    records = parse_common_structure_fixed(df_raw, f'陈定芬{group_name}', 8, 3, 4, 9)
+    for record in records:
+        record['组别'] = group_name
+        record['来源'] = f'陈定芬{group_name}'
+    return records
+
+
+def parse_lixiaoping(df_raw):
+    # 李小萍：名字在第8行，工序信息在第4行，工序序号在第3行
+    return parse_common_structure_fixed(df_raw, '李小萍', 8, 4, 3, 9)
+
+
+def parse_zhangdali(df_raw):
+    # 张大丽：名字在第6行，工序信息在第3行，工序序号在第4行
+    return parse_common_structure_fixed(df_raw, '张大丽', 6, 3, 4, 9)
+
+
+def parse_rework_sheet_customized(file_path):
+    all_melted_rows = []
+
+    try:
+        all_sheets = pd.read_excel(file_path, header=None, sheet_name=None)
+    except Exception as e:
+        print(f"  错误: 打开文件 {file_path} 失败: {e}")
+        return None
+
+    for df_raw in all_sheets.values():
+        if df_raw.empty:
             continue
 
-    if all_rework_records:
-        rework_df = pd.DataFrame(all_rework_records)
-        rework_df['款号_清洗'] = rework_df['款号'].apply(clean_style_number)
+        file_basename = os.path.basename(file_path)
 
-        # 去重
-        before_dedup = len(rework_df)
-        rework_df = rework_df.drop_duplicates(
-            subset=['款号_清洗', '日期', '工人姓名', '返工数量', '工序名称_返工']
-        )
-        after_dedup = len(rework_df)
+        # 根据文件名选择对应的解析函数
+        if '陈亚梅' in file_basename:
+            records = parse_chenyamei(df_raw)
+        elif '范丽' in file_basename:
+            records = parse_fanli(df_raw)
+        elif '范嗣惠' in file_basename:
+            records = parse_fansihui(df_raw)
+        elif '曾繁利' in file_basename:
+            records = parse_zengfanli(df_raw)
+        elif '陈定芬6组' in file_basename:
+            records = parse_chendingfen(df_raw, '6组')
+        elif '陈定芬7组' in file_basename:
+            records = parse_chendingfen(df_raw, '7组')
+        elif '李小萍' in file_basename:
+            records = parse_lixiaoping(df_raw)
+        elif '张大丽' in file_basename:
+            records = parse_zhangdali(df_raw)
+        else:
+            print(f"未知文件类型: {file_basename}，使用默认解析")
+            # 使用陈定芬的解析作为默认
+            records = parse_chendingfen(df_raw, '')
 
-        print(f"\n{'=' * 60}")
-        print(f"总计提取: {before_dedup} 条记录")
-        print(f"去重后: {after_dedup} 条记录 (删除 {before_dedup - after_dedup} 条重复)")
+        if records:
+            all_melted_rows.extend(records)
+        else:
+            print(f"未解析到数据")
 
-        # 详细统计工序名称情况
-        with_process = (rework_df['工序名称_返工'] != '').sum()
-        without_process = (rework_df['工序名称_返工'] == '').sum()
-        print(f"有工序名称的记录: {with_process} 条 ({with_process / len(rework_df) * 100:.1f}%)")
-        print(f"无工序名称的记录: {without_process} 条 ({without_process / len(rework_df) * 100:.1f}%)")
+    if not all_melted_rows:
+        return None
 
-        return rework_df
-    else:
-        print("\n⚠️ 没有提取到任何返工数据")
-        return pd.DataFrame()
-
-
-def enhance_process_name_matching(output_data, rework_df):
-    """增强工序名称匹配 - 专门解决工序名称缺失问题"""
-    print(f"\n{'=' * 60}")
-    print("开始增强工序名称匹配...")
-
-    # 准备产量数据的工序信息
-    output_data['日期'] = pd.to_datetime(output_data['生产时间']).dt.strftime('%Y-%m-%d')
-    output_data['款号_清洗'] = output_data['款号'].apply(clean_style_number)
-
-    # 创建工序名称映射
-    process_mapping = {}
-
-    # 按工人+款号+日期分组，收集工序名称
-    grouped = output_data.groupby(['员工名称', '款号_清洗', '日期'])
-    for (worker, style, date), group in grouped:
-        key = (worker, style, date)
-        processes = group['工序'].dropna().unique()
-        if len(processes) > 0:
-            process_mapping[key] = list(processes)
-
-    print(f"从产量数据构建了 {len(process_mapping)} 个工序映射组")
-
-    # 应用映射到返工数据
-    enhanced_count = 0
-    for idx, row in rework_df.iterrows():
-        if row['工序名称_返工'] == '' and row['返工数量'] > 0:
-            key = (row['工人姓名'], row['款号_清洗'], row['日期'])
-            if key in process_mapping:
-                processes = process_mapping[key]
-                if processes:
-                    # 使用该组中最常见的工序名称
-                    rework_df.at[idx, '工序名称_返工'] = processes[0]
-                    enhanced_count += 1
-
-    print(f"通过产量数据匹配补充了 {enhanced_count} 条工序名称")
-
-    # 基于历史数据的工序名称推测
-    print("\n基于历史数据推测工序名称...")
-
-    # 收集每个工人对每个款号最常做的工序
-    worker_style_process = {}
-    valid_records = rework_df[rework_df['工序名称_返工'] != '']
-
-    if not valid_records.empty:
-        for (worker, style), group in valid_records.groupby(['工人姓名', '款号_清洗']):
-            processes = group['工序名称_返工'].value_counts()
-            if len(processes) > 0:
-                worker_style_process[(worker, style)] = processes.index[0]
-
-    print(f"构建了 {len(worker_style_process)} 个工人-款号工序映射")
-
-    # 应用历史映射
-    historical_count = 0
-    for idx, row in rework_df.iterrows():
-        if row['工序名称_返工'] == '' and row['返工数量'] > 0:
-            key = (row['工人姓名'], row['款号_清洗'])
-            if key in worker_style_process:
-                rework_df.at[idx, '工序名称_返工'] = worker_style_process[key]
-                historical_count += 1
-
-    print(f"通过历史数据补充了 {historical_count} 条工序名称")
-
-    # 最终统计
-    final_with_process = (rework_df['工序名称_返工'] != '').sum()
-    final_without_process = (rework_df['工序名称_返工'] == '').sum()
-
-    print(f"\n增强匹配完成:")
-    print(f"  有工序名称的记录: {final_with_process} 条 ({final_with_process / len(rework_df) * 100:.1f}%)")
-    print(f"  无工序名称的记录: {final_without_process} 条 ({final_without_process / len(rework_df) * 100:.1f}%)")
-
-    return rework_df
+    return pd.DataFrame(all_melted_rows)
 
 
-def merge_rework_with_output_improved(output_data, rework_df):
-    """改进的合并函数,确保工序名称不丢失"""
-    print(f"\n{'=' * 60}")
-    print("开始合并返工数据...")
+def merge_rework_data():
+    # 读取数据
+    base_file = "产量数据_工序表合并.xlsx"
+    rework_folder = "返工数量"
 
-    # 准备产量数据
-    if '款号_清洗' not in output_data.columns:
-        output_data['款号_清洗'] = output_data['款号'].apply(clean_style_number)
-    if '日期' not in output_data.columns:
-        output_data['日期'] = pd.to_datetime(output_data['生产时间']).dt.strftime('%Y-%m-%d')
+    df_main = pd.read_excel(base_file, dtype={'工号': str, '工序序号': str})
 
-    print(f"产量数据记录数: {len(output_data)}")
-    print(f"返工数据记录数: {len(rework_df)}")
-    print(f"返工数据中有工序名称的记录: {(rework_df['工序名称_返工'] != '').sum()} 条")
+    rework_files = glob(os.path.join(rework_folder, "*.xlsx"))
+    rework_files = [f for f in rework_files if not os.path.basename(f).startswith('~$')]
 
-    # 第一步：增强工序名称匹配
-    rework_df = enhance_process_name_matching(output_data, rework_df)
+    all_rework_dfs = []
+    for file in rework_files:
+        print(f"处理: {os.path.basename(file)}")
+        df_rework_part = parse_rework_sheet_customized(file)
+        if df_rework_part is not None and not df_rework_part.empty:
+            all_rework_dfs.append(df_rework_part)
 
-    # 添加一个标识列用于跟踪匹配过程
-    output_data['_merge_id'] = range(len(output_data))
+    if not all_rework_dfs:
+        print("没有解析到返工数据")
+        return
 
-    # 策略1: 精确匹配 (款号+日期+工人)
-    print("\n策略1: 款号+日期+工人 精确匹配...")
+    df_rework_total = pd.concat(all_rework_dfs, ignore_index=True)
+    print(f"解析到 {len(df_rework_total)} 条返工记录")
 
-    # 准备返工数据 - 保留所有记录包括工序名称为空的
-    rework_for_merge = rework_df[['款号_清洗', '日期', '工人姓名', '返工数量', '工序名称_返工']].copy()
+    # 主数据
+    if '日期' in df_main.columns:
+        df_main['merge_date'] = pd.to_datetime(df_main['日期']).dt.strftime('%Y-%m-%d')
+    elif '生产时间' in df_main.columns:
+        df_main['merge_date'] = pd.to_datetime(df_main['生产时间']).dt.strftime('%Y-%m-%d')
 
-    merged = pd.merge(
-        output_data,
-        rework_for_merge,
-        left_on=['款号_清洗', '日期', '员工名称'],
-        right_on=['款号_清洗', '日期', '工人姓名'],
-        how='left',
-        suffixes=('', '_rework')
+    df_main['merge_style'] = df_main['清洗后款号'].apply(clean_style_number).astype(str).str.strip()
+    name_col = '姓名' if '姓名' in df_main.columns else '员工名称'
+    df_main['merge_name'] = df_main[name_col].astype(str).str.strip()
+
+    # 返工数据
+    df_rework_total['merge_date'] = pd.to_datetime(df_rework_total['日期']).dt.strftime('%Y-%m-%d')
+    df_rework_total['merge_style'] = df_rework_total['款号'].apply(clean_style_number).astype(str).str.strip()
+    df_rework_total['merge_name'] = df_rework_total['姓名'].astype(str).str.strip()
+
+    print("\n=== 匹配方案: 款号+日期+员工名称+工序序号一对一匹配 ===")
+
+    # 主数据
+    df_main['merge_process_seq'] = df_main['工序序号'].astype(str).str.strip()
+    # 返工数据
+    df_rework_total['merge_process_seq'] = df_rework_total['返工率表格中的工序序号'].astype(str).str.strip()
+
+    df_final = pd.merge(
+        df_main,
+        df_rework_total[['merge_style', 'merge_date', 'merge_name', 'merge_process_seq',
+                         '每日返工数量', '返工率表格中的工序名称', '返工率表格中的工序序号']],
+        on=['merge_style', 'merge_date', 'merge_name', 'merge_process_seq'],
+        how='left'
     )
-    match1 = merged['返工数量'].notna().sum()
-    print(f"  匹配成功: {match1} 条")
 
-    # 统计有工序名称的记录
-    process_match1 = (merged['工序名称_返工'].notna() & (merged['工序名称_返工'] != '')).sum()
-    print(f"  有工序名称的记录: {process_match1} 条")
+    df_final['每日返工数量'] = df_final['每日返工数量'].fillna(0)
+    df_final['返工率表格中的工序名称'] = df_final['返工率表格中的工序名称'].fillna('')
+    # df_final['返工率表格中的工序序号'] = df_final['返工率表格中的工序序号'].fillna('')
 
-    # 策略2: 对于未匹配的,尝试只用款号+日期匹配
-    print("\n策略2: 款号+日期 宽松匹配 (用于未匹配的记录)...")
+    matched_count = (df_final['每日返工数量'] > 0).sum()
+    print(f"精确匹配数: {matched_count}")
 
-    # 找出未匹配的记录
-    unmatched_mask = merged['返工数量'].isna()
+    # 清理临时列
+    columns_to_drop = ['merge_date', 'merge_style', 'merge_name', 'merge_process_seq', '返工率表格中的工序序号']
+    df_final = df_final.drop(columns=[col for col in columns_to_drop if col in df_final.columns])
 
-    if unmatched_mask.sum() > 0:
-        # 对返工数据按款号和日期聚合 - 关键修改:改进工序名称的聚合方式
-        def aggregate_process_names(series):
-            """聚合工序名称,保留非空值"""
-            valid_names = [str(v).strip() for v in series if pd.notna(v) and str(v).strip() != '']
-            if valid_names:
-                # 返回出现频率最高的工序名称
-                from collections import Counter
-                counter = Counter(valid_names)
-                return counter.most_common(1)[0][0]  # 返回最常见的工序名称
-            return ''
+    # 确保所有列都存在且位置正确
+    if '每日返工数量' not in df_final.columns:
+        df_final['每日返工数量'] = 0
+    if '返工率表格中的工序名称' not in df_final.columns:
+        df_final['返工率表格中的工序名称'] = ''
 
-        rework_agg = rework_df.groupby(['款号_清洗', '日期']).agg({
-            '返工数量': 'sum',
-            '工人姓名': lambda x: ','.join(sorted(set(x))),
-            '工序名称_返工': aggregate_process_names
-        }).reset_index()
-        rework_agg.columns = ['款号_清洗', '日期', '返工数量_汇总', '返工工人', '返工工序_汇总']
-
-        # 为未匹配的记录进行第二次匹配
-        unmatched_data = merged[unmatched_mask][['_merge_id', '款号_清洗', '日期']].copy()
-        matched2 = pd.merge(
-            unmatched_data,
-            rework_agg,
-            on=['款号_清洗', '日期'],
-            how='left'
-        )
-
-        # 将第二次匹配的结果填充回去
-        for idx, row in matched2.iterrows():
-            if pd.notna(row['返工数量_汇总']):
-                merge_id = row['_merge_id']
-                merged.loc[merged['_merge_id'] == merge_id, '返工数量'] = row['返工数量_汇总']
-                # 只有当原工序名称为空时才填充汇总的工序名称
-                current_process = merged.loc[merged['_merge_id'] == merge_id, '工序名称_返工'].iloc[0]
-                if pd.isna(current_process) or current_process == '':
-                    merged.loc[merged['_merge_id'] == merge_id, '工序名称_返工'] = row['返工工序_汇总']
-
-        match2 = matched2['返工数量_汇总'].notna().sum()
-        process_match2 = (matched2['返工工序_汇总'].notna() & (matched2['返工工序_汇总'] != '')).sum()
-        print(f"  额外匹配: {match2} 条")
-        print(f"  有工序名称的额外记录: {process_match2} 条")
-    else:
-        match2 = 0
-        process_match2 = 0
-
-    # 策略3: 对于仍然没有工序名称但返工数量>0的记录，尝试从其他匹配记录中获取工序名称
-    print("\n策略3: 补充缺失的工序名称...")
-
-    # 找出返工数量>0但工序名称为空的记录
-    rework_no_process = merged[(merged['返工数量'] > 0) &
-                               (merged['工序名称_返工'].isna() | (merged['工序名称_返工'] == ''))]
-
-    if len(rework_no_process) > 0:
-        print(f"  发现 {len(rework_no_process)} 条返工记录缺少工序名称")
-
-        # 为这些记录查找可能的工序名称
-        process_filled_count = 0
-        for idx, row in rework_no_process.iterrows():
-            merge_id = row['_merge_id']
-
-            # 方法1: 从同一款号、日期、工人的其他返工记录中查找
-            same_worker_records = rework_df[
-                (rework_df['款号_清洗'] == row['款号_清洗']) &
-                (rework_df['日期'] == row['日期']) &
-                (rework_df['工人姓名'] == row['员工名称']) &
-                (rework_df['工序名称_返工'] != '')
-                ]
-
-            if len(same_worker_records) > 0:
-                # 使用最常见的工序名称
-                process_names = same_worker_records['工序名称_返工'].value_counts()
-                most_common_process = process_names.index[0]
-                merged.loc[merged['_merge_id'] == merge_id, '工序名称_返工'] = most_common_process
-                process_filled_count += 1
-                continue
-
-            # 方法2: 从同一款号、日期的其他返工记录中查找
-            same_style_records = rework_df[
-                (rework_df['款号_清洗'] == row['款号_清洗']) &
-                (rework_df['日期'] == row['日期']) &
-                (rework_df['工序名称_返工'] != '')
-                ]
-
-            if len(same_style_records) > 0:
-                process_names = same_style_records['工序名称_返工'].value_counts()
-                most_common_process = process_names.index[0]
-                merged.loc[merged['_merge_id'] == merge_id, '工序名称_返工'] = most_common_process
-                process_filled_count += 1
-
-        print(f"  通过策略3补充了 {process_filled_count} 条工序名称")
-
-    # 填充缺失值
-    merged['返工数量'] = merged['返工数量'].fillna(0)
-    merged['工序名称_返工'] = merged['工序名称_返工'].fillna('')
-
-    # 删除辅助列
-    columns_to_drop = ['工人姓名', '_merge_id']
-    for col in columns_to_drop:
-        if col in merged.columns:
-            merged = merged.drop(columns=[col])
-
-    print(f"\n合并完成:")
-    print(f"  总记录数: {len(merged)}")
-    total_rework = len(merged[merged['返工数量'] > 0])
-    print(f"  有返工记录: {total_rework} ({total_rework / len(merged) * 100:.2f}%)")
-
-    with_process = len(merged[(merged['返工数量'] > 0) & (merged['工序名称_返工'] != '')])
-    without_process = len(merged[(merged['返工数量'] > 0) & (merged['工序名称_返工'] == '')])
-    print(f"  有工序名称的返工记录: {with_process} 条 ({with_process / total_rework * 100:.1f}% of rework)")
-    print(f"  无工序名称的返工记录: {without_process} 条 ({without_process / total_rework * 100:.1f}% of rework)")
-    print(f"  返工总数量: {merged['返工数量'].sum():.0f}")
-
-    # 显示一些样本数据用于验证
-    print(f"\n返工记录样本(前5条):")
-    sample = merged[merged['返工数量'] > 0][['款号', '日期', '员工名称', '返工数量', '工序名称_返工']].head()
-    if not sample.empty:
-        print(sample.to_string(index=False))
-
-    # 显示有工序名称的样本
-    process_sample = merged[(merged['返工数量'] > 0) & (merged['工序名称_返工'] != '')][
-        ['款号', '日期', '员工名称', '返工数量', '工序名称_返工']].head()
-    if not process_sample.empty:
-        print(f"\n有工序名称的返工记录样本(前5条):")
-        print(process_sample.to_string(index=False))
-
-    # 显示无工序名称的样本
-    no_process_sample = merged[(merged['返工数量'] > 0) & (merged['工序名称_返工'] == '')][
-        ['款号', '日期', '员工名称', '返工数量', '工序名称_返工']].head()
-    if not no_process_sample.empty:
-        print(f"\n无工序名称的返工记录样本(前5条):")
-        print(no_process_sample.to_string(index=False))
-
-    return merged
-
-
-def main():
-    """主函数"""
-    print("=" * 60)
-    print("改进版返工数据提取与合并程序")
-    print("=" * 60)
-
-    # 1. 加载产量数据
-    print("\n加载产量数据...")
-    output_data = pd.read_excel('半年产量数据/3-8月车缝数据.xlsx')
-    print(f"产量数据: {output_data.shape[0]} 行, {output_data.shape[1]} 列")
-
-    # 2. 提取返工数据
-    rework_df = extract_rework_data_improved()
-
-    if not rework_df.empty:
-        # 保存提取的返工数据
-        rework_df.to_excel('改进提取的返工数据.xlsx', index=False)
-        print(f"\n返工数据已保存到: 改进提取的返工数据.xlsx")
-
-        # 显示统计信息
-        print(f"\n返工数据统计:")
-        print(f"  不同款号数: {rework_df['款号_清洗'].nunique()}")
-        print(f"  不同工人数: {rework_df['工人姓名'].nunique()}")
-        print(f"  日期范围: {rework_df['日期'].min()} 至 {rework_df['日期'].max()}")
-        print(f"  返工总数: {rework_df['返工数量'].sum():.0f}")
-
-        with_process = (rework_df['工序名称_返工'] != '').sum()
-        without_process = (rework_df['工序名称_返工'] == '').sum()
-        print(f"  有工序名称的记录: {with_process} 条 ({with_process / len(rework_df) * 100:.1f}%)")
-        print(f"  无工序名称的记录: {without_process} 条 ({without_process / len(rework_df) * 100:.1f}%)")
-
-        # 显示工序名称统计
-        if (rework_df['工序名称_返工'] != '').any():
-            process_stats = rework_df[rework_df['工序名称_返工'] != '']['工序名称_返工'].value_counts().head(10)
-            print(f"\n最常见的工序名称 TOP 10:")
-            for process, count in process_stats.items():
-                print(f"  {process}: {count} 条记录")
-
-        # 3. 合并数据
-        merged_data = merge_rework_with_output_improved(output_data, rework_df)
-
-        # 4. 保存结果
-        print(f"\n保存结果...")
-        merged_data.to_excel('产量数据_返工合并结果.xlsx', index=False)
-        print(f"结果已保存到: 产量数据_返工合并结果.xlsx")
-
-        # 5. 生成详细报告
-        print(f"\n{'=' * 60}")
-        print("详细统计报告")
-        print(f"{'=' * 60}")
-
-        print(f"\n按文件统计返工记录:")
-        file_stats = rework_df.groupby('来源文件').agg({
-            '返工数量': ['count', 'sum'],
-            '工序名称_返工': lambda x: (x != '').sum()
-        }).round(0)
-        file_stats.columns = ['记录数', '返工总数', '有工序名称记录数']
-        print(file_stats)
-
-        print(f"\n返工最多的工人 TOP 10:")
-        worker_stats = rework_df.groupby('工人姓名')['返工数量'].sum().sort_values(ascending=False).head(10)
-        for worker, qty in worker_stats.items():
-            print(f"  {worker}: {qty:.0f}")
-
-    else:
-        print("\n⚠️ 未能提取到返工数据,程序结束")
+    # 保存结果
+    output_file = "产量数据_工序_返工_合并_test.xlsx"
+    df_final.to_excel(output_file, index=False)
+    print(f"\n结果已保存到: {output_file}")
+    print(f"总匹配数: {(df_final['每日返工数量'] > 0).sum()}")
+    print(f"总返工件数: {df_final['每日返工数量'].sum()}")
+    print(f"包含返工工序名称的记录数: {(df_final['返工率表格中的工序名称'] != '').sum()}")
 
 
 if __name__ == "__main__":
-    main()
+    merge_rework_data()
